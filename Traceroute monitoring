@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""
+traceroute_analyzer.py
+
+- Menjalankan `traceroute <target>` dan menampilkan output traceroute langsung (real-time).
+- Setelah selesai, mem-parse output tersebut dan menganalisis hop mana yang berpotensi mengalami
+  kemacetan berdasarkan:
+    * avg latency > 100 ms, atau
+    * peningkatan latency antar-hop > 50 ms
+- Menyimpan output mentah ke file log.
+"""
+
+import subprocess
+import time
+import re
+import shutil
+import sys
+
+target = "www.netacad.com"
+log_file = "traceroute_log.txt"
+
+def check_traceroute_installed():
+    return shutil.which("traceroute") is not None
+
+def run_traceroute_and_capture(target):
+    """
+    Menjalankan traceroute dan mengembalikan list baris output mentah.
+    Output juga langsung dicetak ke layar (real-time).
+    """
+    raw_lines = []
+    try:
+        proc = subprocess.Popen(["traceroute", target], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    except FileNotFoundError:
+        raise
+
+    # Stream output real-time, simpan setiap baris
+    while True:
+        line = proc.stdout.readline()
+        if not line and proc.poll() is not None:
+            break
+        if line:
+            print(line.rstrip())
+            raw_lines.append(line.rstrip())
+    # Pastikan semua sisa stdout terbaca
+    remaining = proc.stdout.read()
+    if remaining:
+        for line in remaining.splitlines():
+            print(line)
+            raw_lines.append(line)
+    return_code = proc.wait()
+    return raw_lines, return_code
+
+def save_raw_log(raw_lines, target):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    with open(log_file, "a") as f:
+        f.write(f"\n=== Traceroute to {target} at {ts} ===\n")
+        for l in raw_lines:
+            f.write(l + "\n")
+        f.write("\n")
+    print(f"\nHasil traceroute mentah tersimpan di: {log_file}")
+
+def parse_traceroute_lines(raw_lines):
+    """
+    Mengambil list (hop_num, hostname_or_star, ip_or_none, latency_list(float) or empty list)
+    - Jika baris berisi '*' (timeout) maka latency_list = []
+    """
+    hops = []
+    for line in raw_lines:
+        # Skip header line like "traceroute to ..."
+        if line.strip().lower().startswith("traceroute to"):
+            continue
+        # Cari nomor hop di awal
+        m = re.match(r'^\s*(\d+)\s+(.*)$', line)
+        if not m:
+            continue
+        hop_num = int(m.group(1))
+        rest = m.group(2).strip()
+
+        # Cari IP di dalam kurung bila ada
+        ip_m = re.search(r'\(([\d\.]+)\)', rest)
+        ip = ip_m.group(1) if ip_m else None
+
+        # Hostname: token sebelum '(' jika ada, atau token pertama (bisa jadi '*')
+        if ip_m:
+            host_part = rest[:ip_m.start()].strip()
+            host = host_part.split()[0] if host_part else None
+        else:
+            # Jika tidak ada '(', mungkin format: "hostname ip time time time" or "* * *"
+            host = rest.split()[0] if rest.split() else None
+
+        # Ambil semua nilai waktu seperti "12.345 ms" atau "12 ms"
+        latency_matches = re.findall(r'(\d+\.\d+|\d+)\s*ms', rest)
+        latencies = [float(x) for x in latency_matches] if latency_matches else []
+
+        # Jika baris mengandung banyak '*' atau hanya '*' maka latencies tetap kosong
+        hops.append({
+            "hop": hop_num,
+            "host": host,
+            "ip": ip,
+            "latencies": latencies,
+            "raw": line
+        })
+    return hops
+
+def analyze_hops(hops):
+    """
+    Menghitung rata-rata tiap hop bila ada latencies,
+    lalu mendeteksi bottleneck berdasarkan:
+      - avg_latency > 100 ms
+      - atau kenaikan terhadap hop sebelumnya > 50 ms
+    Mengembalikan list analisa per hop.
+    """
+    analysis = []
+    prev_avg = None
+    for entry in hops:
+        lat = entry["latencies"]
+        if lat:
+            avg = sum(lat) / len(lat)
+        else:
+            avg = None  # timeout atau tidak ada respon
+        entry["avg"] = avg
+
+        # Hitung diff terhadap hop sebelumnya bila kedua-duanya punya avg
+        diff = None
+        if prev_avg is not None and avg is not None:
+            diff = avg - prev_avg
+
+        # Deteksi kondisi bottleneck
+        bottleneck = False
+        reasons = []
+        if avg is None:
+            reasons.append("no response (timeout)")
+        else:
+            if avg > 100:
+                bottleneck = True
+                reasons.append(f"avg {avg:.2f} ms > 100 ms")
+            if diff is not None and diff > 50:
+                bottleneck = True
+                reasons.append(f"increase +{diff:.2f} ms vs prev hop")
+
+        analysis.append({
+            "hop": entry["hop"],
+            "host": entry["host"],
+            "ip": entry["ip"],
+            "avg": avg,
+            "diff_vs_prev": diff,
+            "bottleneck": bottleneck,
+            "reasons": reasons,
+            "raw": entry["raw"]
+        })
+
+        prev_avg = avg if avg is not None else prev_avg
+
+    return analysis
+
+def print_analysis(analysis):
+    print("\n=== Analisis Traceroute (berdasarkan output di atas) ===")
+    bottlenecks = 0
+    for a in analysis:
+        hop = a["hop"]
+        host = a["host"] if a["host"] else "-"
+        ip = a["ip"] if a["ip"] else "-"
+        if a["avg"] is None:
+            avg_str = "timeout/*"
+        else:
+            avg_str = f"{a['avg']:.2f} ms"
+        print(f"Hop {hop:2d}: {host:20s} {ip:15s}  avg={avg_str}", end='')
+        if a["diff_vs_prev"] is not None:
+            print(f"  diff_vs_prev={a['diff_vs_prev']:+.2f} ms", end='')
+        if a["bottleneck"]:
+            print(f"  <-- POTENSIAL KEMACETAN ({'; '.join(a['reasons'])})")
+            bottlenecks += 1
+        else:
+            print()
+    if bottlenecks == 0:
+        print("\n✅ Tidak ditemukan kemacetan signifikan berdasarkan kriteria (avg>100 ms atau kenaikan>50 ms).")
+    else:
+        print(f"\n⚠️ Ditemukan {bottlenecks} hop yang berpotensi mengalami kemacetan. Perhatikan baris-baris tersebut di output traceroute mentah.\n")
+
+def main():
+    if not check_traceroute_installed():
+        print("Perintah 'traceroute' tidak ditemukan di sistemmu.")
+        print("Silakan install dulu (di DEVASC/Ubuntu):")
+        print("  sudo apt update")
+        print("  sudo apt install traceroute -y")
+        sys.exit(1)
+
+    print(f"Menjalankan traceroute ke: {target}\n")
+    try:
+        raw_lines, code = run_traceroute_and_capture(target)
+    except FileNotFoundError:
+        print("Error menjalankan traceroute. Pastikan paket 'traceroute' sudah terpasang.")
+        sys.exit(1)
+
+    # Simpan mentah ke log
+    save_raw_log(raw_lines, target)
+
+    # Parse lalu analisa
+    hops = parse_traceroute_lines(raw_lines)
+    if not hops:
+        print("Gagal mem-parse hasil traceroute atau traceroute tidak menghasilkan hop.")
+        sys.exit(1)
+
+    analysis = analyze_hops(hops)
+
+    # Tampilkan hasil analisis (setelah semua output traceroute terlihat)
+    print_analysis(analysis)
+    print(f"Analisis selesai. Detail lengkap ada di file log: {log_file}")
+
+if __name__ == "__main__":
+    main()
